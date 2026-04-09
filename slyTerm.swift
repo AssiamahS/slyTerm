@@ -164,9 +164,15 @@ class AppWindow: NSWindow {
 }
 
 // Intercept Cmd shortcuts before WebView can swallow them
+// But let Cmd+C/V/X/A pass through to WebView for terminal copy/paste
 func installKeyMonitor() {
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
         if event.modifierFlags.contains(.command) {
+            let chars = event.charactersIgnoringModifiers ?? ""
+            // Let copy/paste/cut/selectAll go to WebView (xterm.js handles them)
+            if ["c", "v", "x", "a"].contains(chars) {
+                return event
+            }
             if let mainMenu = NSApp.mainMenu, mainMenu.performKeyEquivalent(with: event) {
                 return nil // consumed
             }
