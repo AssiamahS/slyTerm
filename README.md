@@ -1,14 +1,16 @@
-# slyTerm
+<p align="center">
+  <img src="assets/icon.png" width="200" alt="slyTerm">
+</p>
 
-A lightweight native macOS terminal app powered by [ttyd](https://github.com/nickvdp/ttyd). Split panes, multiple windows, zero Electron.
+<h1 align="center">slyTerm</h1>
 
 <p align="center">
-  <img src="assets/icon.png" width="128" alt="slyTerm icon">
+  <strong>A lightweight native macOS terminal with split panes. Zero Electron.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/AssiamahS/slyTerm/releases/latest">
-    <img src="https://img.shields.io/badge/Download-macOS-black?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS">
+    <img src="https://img.shields.io/badge/%E2%80%8E%20Download_on_the-Mac_App_Store-black?style=for-the-badge&logo=apple&logoColor=white" alt="Download on the Mac App Store">
   </a>
 </p>
 
