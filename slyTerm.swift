@@ -163,6 +163,23 @@ class AppWindow: NSWindow {
     }
 }
 
+// Clear xterm selection on all panes when clicking anywhere
+func installClickMonitor() {
+    NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { event in
+        if let delegate = NSApp.delegate as? AppDelegate {
+            for entry in delegate.windows {
+                for pane in entry.split.panes {
+                    pane.webView.evaluateJavaScript(
+                        "if(window.term&&window.term.hasSelection())window.term.clearSelection()",
+                        completionHandler: nil
+                    )
+                }
+            }
+        }
+        return event
+    }
+}
+
 // Intercept Cmd shortcuts before WebView can swallow them
 // But let Cmd+C/V/X/A pass through to WebView for terminal copy/paste
 func installKeyMonitor() {
@@ -187,6 +204,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         installKeyMonitor()
+        installClickMonitor()
         openNewWindow()
     }
 
