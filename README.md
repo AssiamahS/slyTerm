@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/AssiamahS/slyTerm/releases/latest">
-    <img src="https://img.shields.io/badge/%E2%80%8E%20Download_on_the-Mac_App_Store-black?style=for-the-badge&logo=apple&logoColor=white" alt="Download on the Mac App Store">
+    <img src="assets/mac-app-store-badge.svg" width="200" alt="Download on the Mac App Store">
   </a>
 </p>
 
@@ -19,6 +19,12 @@
   <img src="https://img.shields.io/badge/architecture-Apple%20Silicon-orange?style=flat-square" alt="Apple Silicon">
   <img src="https://img.shields.io/github/v/release/AssiamahS/slyTerm?style=flat-square" alt="Release">
   <img src="https://img.shields.io/github/license/AssiamahS/slyTerm?style=flat-square" alt="License">
+</p>
+
+---
+
+<p align="center">
+  <img src="assets/screenshot.png" width="700" alt="slyTerm screenshot">
 </p>
 
 ---
