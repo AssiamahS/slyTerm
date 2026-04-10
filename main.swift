@@ -10,7 +10,7 @@ final class DropOverlayView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL, .string, .URL])
+        registerForDraggedTypes([.fileURL, .string, .URL, .tiff, .png])
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -109,12 +109,32 @@ class TermPane: NSView {
                 let path = url.isFileURL ? url.path : url.absoluteString
                 return path.contains(" ") ? "\"\(path)\"" : path
             }.joined(separator: " ")
+        } else if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage], !images.isEmpty {
+            // Raw image data drag (e.g. screenshot tools like Shottr/CleanShot
+            // before the image is committed to disk). Save to a known
+            // dropbox dir and inject the resulting path.
+            let saved = images.compactMap { Self.saveDroppedImage($0) }
+            if !saved.isEmpty {
+                text = saved.map { $0.contains(" ") ? "\"\($0)\"" : $0 }.joined(separator: " ")
+            }
         } else if let str = pb.string(forType: .string) {
             text = str
         }
         guard let payload = text else { return false }
         injectIntoTerminal(payload)
         return true
+    }
+
+    private static func saveDroppedImage(_ image: NSImage) -> String? {
+        let dir = ("~/Pictures/slyterm-drops" as NSString).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        let path = "\(dir)/drop-\(fmt.string(from: Date())).png"
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        return (try? png.write(to: URL(fileURLWithPath: path))) != nil ? path : nil
     }
 
     func injectIntoTerminal(_ text: String) {
