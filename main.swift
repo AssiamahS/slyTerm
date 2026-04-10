@@ -296,7 +296,9 @@ final class DockAnimator {
         } else {
             activeImage = nil
         }
-        apply(.idle, force: true)
+        // Don't touch the dock tile at init — the default AppIcon is already
+        // showing and forcing it now (before NSApp is ready) caused a black
+        // flash on launch.
     }
 
     /// Render `image` centered on a 1024×1024 transparent canvas at 65% scale.
@@ -479,6 +481,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return windows.isEmpty
+    }
+
+    // Clicking the dock icon when no windows are visible should open one.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { openNewWindow() }
+        return true
     }
 }
 
