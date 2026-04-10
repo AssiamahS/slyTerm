@@ -10,7 +10,12 @@ final class DropOverlayView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        registerForDraggedTypes([.fileURL, .string, .URL, .tiff, .png])
+        var types: [NSPasteboard.PasteboardType] = [.fileURL, .string, .URL, .tiff, .png]
+        // File promise types — macOS screenshot floating thumbnail and other
+        // NSItemProvider sources hand off via NSFilePromiseReceiver instead of
+        // a direct file URL.
+        types.append(contentsOf: NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType(rawValue: $0) })
+        registerForDraggedTypes(types)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -103,26 +108,62 @@ class TermPane: NSView {
 
     private func handleDrop(_ sender: NSDraggingInfo) -> Bool {
         let pb = sender.draggingPasteboard
-        var text: String? = nil
+
+        // 1. Direct file URLs (Finder, most apps)
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
-            text = urls.map { url -> String in
+            let text = urls.map { url -> String in
                 let path = url.isFileURL ? url.path : url.absoluteString
                 return path.contains(" ") ? "\"\(path)\"" : path
             }.joined(separator: " ")
-        } else if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage], !images.isEmpty {
-            // Raw image data drag (e.g. screenshot tools like Shottr/CleanShot
-            // before the image is committed to disk). Save to a known
-            // dropbox dir and inject the resulting path.
+            injectIntoTerminal(text)
+            return true
+        }
+
+        // 2. File promises (macOS screenshot floating thumbnail, Mail attachments,
+        // anything using NSItemProvider with a file representation). The sender
+        // hands us NSFilePromiseReceivers; we resolve them to real files in our
+        // dropbox dir. The resolution is async, so we accept the drop now and
+        // inject when the files materialize.
+        if let receivers = pb.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver], !receivers.isEmpty {
+            let destStr = ("~/Pictures/slyterm-drops" as NSString).expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: destStr, withIntermediateDirectories: true)
+            let dest = URL(fileURLWithPath: destStr)
+            let queue = OperationQueue()
+            var paths: [String] = []
+            let group = DispatchGroup()
+            for receiver in receivers {
+                group.enter()
+                receiver.receivePromisedFiles(atDestination: dest, options: [:], operationQueue: queue) { url, error in
+                    if error == nil { paths.append(url.path) }
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) { [weak self] in
+                guard !paths.isEmpty else { return }
+                let text = paths.map { $0.contains(" ") ? "\"\($0)\"" : $0 }.joined(separator: " ")
+                self?.injectIntoTerminal(text)
+            }
+            return true
+        }
+
+        // 3. Raw image data (Shottr/CleanShot snap mode — image bytes on the
+        // pasteboard with no file URL or promise).
+        if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage], !images.isEmpty {
             let saved = images.compactMap { Self.saveDroppedImage($0) }
             if !saved.isEmpty {
-                text = saved.map { $0.contains(" ") ? "\"\($0)\"" : $0 }.joined(separator: " ")
+                let text = saved.map { $0.contains(" ") ? "\"\($0)\"" : $0 }.joined(separator: " ")
+                injectIntoTerminal(text)
+                return true
             }
-        } else if let str = pb.string(forType: .string) {
-            text = str
         }
-        guard let payload = text else { return false }
-        injectIntoTerminal(payload)
-        return true
+
+        // 4. Plain string fallback
+        if let str = pb.string(forType: .string) {
+            injectIntoTerminal(str)
+            return true
+        }
+
+        return false
     }
 
     private static func saveDroppedImage(_ image: NSImage) -> String? {
