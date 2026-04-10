@@ -106,11 +106,32 @@ class TermPane: NSView {
 
     // MARK: - Drag and drop -> paste file path into terminal
 
+    private static func dropLog(_ msg: String) {
+        let line = "[\(Date())] \(msg)\n"
+        let path = ("~/Library/Logs/slyterm-drop.log" as NSString).expandingTildeInPath
+        if let data = line.data(using: .utf8) {
+            if let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+                h.seekToEndOfFile(); h.write(data); try? h.close()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+        }
+        FileHandle.standardError.write(line.data(using: .utf8) ?? Data())
+    }
+
     private func handleDrop(_ sender: NSDraggingInfo) -> Bool {
         let pb = sender.draggingPasteboard
 
+        // Debug: log every type the source put on the pasteboard
+        let types = pb.types?.map { $0.rawValue }.joined(separator: ", ") ?? "<nil>"
+        let itemTypes = (pb.pasteboardItems ?? []).enumerated().map { (i, it) in
+            "item\(i)[\(it.types.map { $0.rawValue }.joined(separator: "|"))]"
+        }.joined(separator: " ")
+        Self.dropLog("DROP types=[\(types)] items=\(itemTypes)")
+
         // 1. Direct file URLs (Finder, most apps)
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
+            Self.dropLog("  -> matched NSURL: \(urls.map { $0.path })")
             let text = urls.map { url -> String in
                 let path = url.isFileURL ? url.path : url.absoluteString
                 return path.contains(" ") ? "\"\(path)\"" : path
@@ -125,20 +146,28 @@ class TermPane: NSView {
         // dropbox dir. The resolution is async, so we accept the drop now and
         // inject when the files materialize.
         if let receivers = pb.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver], !receivers.isEmpty {
+            Self.dropLog("  -> matched NSFilePromiseReceiver: count=\(receivers.count) types=\(receivers.flatMap { $0.fileTypes })")
             let destStr = ("~/Pictures/slyterm-drops" as NSString).expandingTildeInPath
             try? FileManager.default.createDirectory(atPath: destStr, withIntermediateDirectories: true)
             let dest = URL(fileURLWithPath: destStr)
             let queue = OperationQueue()
+            queue.maxConcurrentOperationCount = 1   // serialize callbacks (fix v2.5 race)
             var paths: [String] = []
             let group = DispatchGroup()
             for receiver in receivers {
                 group.enter()
                 receiver.receivePromisedFiles(atDestination: dest, options: [:], operationQueue: queue) { url, error in
-                    if error == nil { paths.append(url.path) }
+                    if let error = error {
+                        Self.dropLog("  -> receivePromisedFiles error: \(error)")
+                    } else {
+                        Self.dropLog("  -> receivePromisedFiles got: \(url.path)")
+                        paths.append(url.path)
+                    }
                     group.leave()
                 }
             }
             group.notify(queue: .main) { [weak self] in
+                Self.dropLog("  -> promise resolution complete, paths=\(paths)")
                 guard !paths.isEmpty else { return }
                 let text = paths.map { $0.contains(" ") ? "\"\($0)\"" : $0 }.joined(separator: " ")
                 self?.injectIntoTerminal(text)
@@ -149,6 +178,7 @@ class TermPane: NSView {
         // 3. Raw image data (Shottr/CleanShot snap mode — image bytes on the
         // pasteboard with no file URL or promise).
         if let images = pb.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage], !images.isEmpty {
+            Self.dropLog("  -> matched NSImage: count=\(images.count)")
             let saved = images.compactMap { Self.saveDroppedImage($0) }
             if !saved.isEmpty {
                 let text = saved.map { $0.contains(" ") ? "\"\($0)\"" : $0 }.joined(separator: " ")
@@ -159,10 +189,12 @@ class TermPane: NSView {
 
         // 4. Plain string fallback
         if let str = pb.string(forType: .string) {
+            Self.dropLog("  -> matched plain string")
             injectIntoTerminal(str)
             return true
         }
 
+        Self.dropLog("  -> NO MATCH, returning false")
         return false
     }
 
