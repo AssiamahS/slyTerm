@@ -298,22 +298,28 @@ func installKeyMonitor() {
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
         if event.modifierFlags.contains(.command) {
             let chars = event.charactersIgnoringModifiers ?? ""
-            // Cmd+V: if pasteboard has only file URLs (Finder copy), convert to
-            // a path string and inject — xterm.js paste only sees text/plain.
+            // Cmd+V: always intercept and inject from NSPasteboard. WKWebView
+            // blocks navigator.clipboard.readText() from cross-origin reads, so
+            // xterm.js's own paste handler silently fails when the clipboard
+            // came from another app. Reading the system pasteboard in Swift and
+            // injecting via JS bypasses the WebKit restriction entirely.
             if chars == "v" {
                 let pb = NSPasteboard.general
-                let hasText = (pb.string(forType: .string) ?? "").isEmpty == false
-                if !hasText, let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
-                    let text = urls.map { url -> String in
+                var payload: String? = nil
+                if let s = pb.string(forType: .string), !s.isEmpty {
+                    payload = s
+                } else if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
+                    payload = urls.map { url -> String in
                         let path = url.isFileURL ? url.path : url.absoluteString
                         return path.contains(" ") ? "\"\(path)\"" : path
                     }.joined(separator: " ")
-                    if let delegate = NSApp.delegate as? AppDelegate,
-                       let split = delegate.activeSplit,
-                       split.panes.indices.contains(split.activeIndex) {
-                        split.panes[split.activeIndex].injectIntoTerminal(text)
-                        return nil
-                    }
+                }
+                if let text = payload,
+                   let delegate = NSApp.delegate as? AppDelegate,
+                   let split = delegate.activeSplit,
+                   split.panes.indices.contains(split.activeIndex) {
+                    split.panes[split.activeIndex].injectIntoTerminal(text)
+                    return nil
                 }
                 return event
             }
