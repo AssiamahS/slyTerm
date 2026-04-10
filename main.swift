@@ -117,7 +117,7 @@ class TermPane: NSView {
         return true
     }
 
-    private func injectIntoTerminal(_ text: String) {
+    func injectIntoTerminal(_ text: String) {
         let escaped = text
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "`", with: "\\`")
@@ -298,8 +298,27 @@ func installKeyMonitor() {
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
         if event.modifierFlags.contains(.command) {
             let chars = event.charactersIgnoringModifiers ?? ""
-            // Let copy/paste/cut/selectAll go to WebView (xterm.js handles them)
-            if ["c", "v", "x", "a"].contains(chars) {
+            // Cmd+V: if pasteboard has only file URLs (Finder copy), convert to
+            // a path string and inject — xterm.js paste only sees text/plain.
+            if chars == "v" {
+                let pb = NSPasteboard.general
+                let hasText = (pb.string(forType: .string) ?? "").isEmpty == false
+                if !hasText, let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
+                    let text = urls.map { url -> String in
+                        let path = url.isFileURL ? url.path : url.absoluteString
+                        return path.contains(" ") ? "\"\(path)\"" : path
+                    }.joined(separator: " ")
+                    if let delegate = NSApp.delegate as? AppDelegate,
+                       let split = delegate.activeSplit,
+                       split.panes.indices.contains(split.activeIndex) {
+                        split.panes[split.activeIndex].injectIntoTerminal(text)
+                        return nil
+                    }
+                }
+                return event
+            }
+            // Let copy/cut/selectAll go to WebView (xterm.js handles them)
+            if ["c", "x", "a"].contains(chars) {
                 return event
             }
             if let mainMenu = NSApp.mainMenu, mainMenu.performKeyEquivalent(with: event) {

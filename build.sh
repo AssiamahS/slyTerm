@@ -30,8 +30,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>slyTerm</string>
     <key>CFBundleDisplayName</key><string>slyTerm</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.1</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>2.2</string>
+    <key>CFBundleVersion</key><string>4</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSAppTransportSecurity</key>
@@ -64,3 +64,16 @@ fi
 codesign --force --sign - "$APP"
 
 echo "Built: $APP"
+
+# Install to /Applications (no Finder copy needed — djsly is in admin group)
+INSTALL_DST="/Applications/slyTerm.app"
+if pgrep -x slyTerm >/dev/null; then
+  echo "Quitting running slyTerm..."
+  osascript -e 'tell application "slyTerm" to quit' 2>/dev/null || true
+  sleep 1
+  pkill -x slyTerm 2>/dev/null || true
+fi
+rm -rf "$INSTALL_DST"
+cp -R "$APP" "$INSTALL_DST"
+xattr -dr com.apple.quarantine "$INSTALL_DST" 2>/dev/null || true
+echo "Installed: $INSTALL_DST"
