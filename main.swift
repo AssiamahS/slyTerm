@@ -1,33 +1,64 @@
 import Cocoa
 import WebKit
 
-// WKWebView intercepts Finder drags before its parent NSView ever sees
-// them (it tries to navigate to the file URL). Subclass and forward drops
-// up to the host TermPane so we can paste the path into the terminal.
-final class DropForwardingWebView: WKWebView {
-    weak var dropTarget: TermPane?
+// Transparent overlay that sits ON TOP of the WKWebView and intercepts
+// Finder drags before the web view can swallow them. Using an overlay
+// instead of subclassing WKWebView avoids fighting WebKit's internal drag
+// handling, which became unreliable on macOS 26.
+final class DropOverlayView: NSView {
+    var onDrop: ((NSDraggingInfo) -> Bool)?
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        if let t = dropTarget { return t.draggingEntered(sender) }
-        return super.draggingEntered(sender)
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL, .string, .URL])
     }
+    required init?(coder: NSCoder) { fatalError() }
+
+    // Transparent to mouse/keyboard events so clicks, scroll, and key
+    // input still reach the WKWebView underneath — but visible to the
+    // AppKit drag-and-drop dispatcher, which also uses hitTest: to find
+    // the drop target. Returning nil for everything (the previous
+    // behavior) preserved copy/paste but silently broke Finder drops.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Cross-app drags from Finder dispatch with no NSApp.currentEvent
+        // (the event originated in another process). Claim the hit so we
+        // receive draggingEntered:/performDragOperation:.
+        guard let event = NSApp.currentEvent else { return self }
+        switch event.type {
+        case .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+             .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+             .otherMouseDown, .otherMouseUp, .otherMouseDragged,
+             .mouseMoved, .mouseEntered, .mouseExited,
+             .scrollWheel, .keyDown, .keyUp, .flagsChanged,
+             .cursorUpdate, .tabletPoint, .tabletProximity,
+             .gesture, .magnify, .swipe, .rotate,
+             .beginGesture, .endGesture,
+             .smartMagnify, .pressure, .directTouch, .changeMode:
+            return nil
+        default:
+            // appKitDefined and other system events (used by drag tracking)
+            return self
+        }
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { true }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        if let t = dropTarget { return t.performDragOperation(sender) }
-        return super.performDragOperation(sender)
+        return onDrop?(sender) ?? false
     }
     override func wantsPeriodicDraggingUpdates() -> Bool { false }
 }
 
 class TermPane: NSView {
-    let webView: DropForwardingWebView
+    let webView: WKWebView
+    let dropOverlay = DropOverlayView(frame: .zero)
 
     init() {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
 
-        self.webView = DropForwardingWebView(frame: .zero, configuration: config)
+        self.webView = WKWebView(frame: .zero, configuration: config)
         webView.customUserAgent = "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 (KHTML, like Gecko) slyTerm/1.0"
         super.init(frame: .zero)
         wantsLayer = true
@@ -41,9 +72,18 @@ class TermPane: NSView {
             webView.leadingAnchor.constraint(equalTo: leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
-        webView.dropTarget = self
-        webView.registerForDraggedTypes([.fileURL, .string, .URL])
-        registerForDraggedTypes([.fileURL, .string, .URL])
+        // Drop overlay on top of webView (added last = topmost)
+        dropOverlay.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(dropOverlay)
+        NSLayoutConstraint.activate([
+            dropOverlay.topAnchor.constraint(equalTo: topAnchor),
+            dropOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+            dropOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            dropOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+        dropOverlay.onDrop = { [weak self] info in
+            return self?.handleDrop(info) ?? false
+        }
         if let url = URL(string: "http://localhost:7681") {
             webView.load(URLRequest(url: url))
         }
@@ -61,9 +101,7 @@ class TermPane: NSView {
 
     // MARK: - Drag and drop -> paste file path into terminal
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+    private func handleDrop(_ sender: NSDraggingInfo) -> Bool {
         let pb = sender.draggingPasteboard
         var text: String? = nil
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL], !urls.isEmpty {
@@ -235,9 +273,11 @@ class AppWindow: NSWindow {
     }
 }
 
-// Clear xterm selection on all panes when clicking anywhere
+// Clear xterm selection on all panes when clicking anywhere.
+// Must use mouseDown — mouseUp also fires at the end of a drag-to-select,
+// which would wipe the selection the user just made.
 func installClickMonitor() {
-    NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { event in
+    NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
         if let delegate = NSApp.delegate as? AppDelegate {
             for entry in delegate.windows {
                 for pane in entry.split.panes {
@@ -254,11 +294,8 @@ func installClickMonitor() {
 
 // Intercept Cmd shortcuts before WebView can swallow them
 // But let Cmd+C/V/X/A pass through to WebView for terminal copy/paste.
-// Also pings the DockAnimator on every keystroke so the dock icon flips
-// to the "active" frame while you're typing.
 func installKeyMonitor() {
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-        (NSApp.delegate as? AppDelegate)?.dockAnimator.noteActivity()
         if event.modifierFlags.contains(.command) {
             let chars = event.charactersIgnoringModifiers ?? ""
             // Let copy/paste/cut/selectAll go to WebView (xterm.js handles them)
@@ -273,90 +310,8 @@ func installKeyMonitor() {
     }
 }
 
-// MARK: - DockAnimator
-//
-// Two-state dock tile: idle = the original AppIcon (>_<), active = pixelated
-// DJ-headphones creature loaded from Resources/claude_dj.png. Flips to active
-// on any keystroke, reverts after `idleAfter` seconds of no input. Renders the
-// active frame into a padded canvas so it matches the original icon's
-// proportions instead of filling the whole dock cell.
-
-final class DockAnimator {
-    enum State { case idle, active }
-
-    private let activeImage: NSImage?
-    private(set) var state: State = .idle
-    private var idleTimer: Timer?
-    let idleAfter: TimeInterval = 10
-
-    init() {
-        if let url = Bundle.main.url(forResource: "claude_dj", withExtension: "png"),
-           let raw = NSImage(contentsOf: url) {
-            activeImage = DockAnimator.padToIconCanvas(raw)
-        } else {
-            activeImage = nil
-        }
-        // Don't touch the dock tile at init — the default AppIcon is already
-        // showing and forcing it now (before NSApp is ready) caused a black
-        // flash on launch.
-    }
-
-    /// Render `image` centered on a 1024×1024 transparent canvas at 65% scale.
-    /// This gives the dock tile padding similar to a real app icon, instead
-    /// of having the creature fill the entire cell.
-    static func padToIconCanvas(_ image: NSImage) -> NSImage {
-        let canvasSize = NSSize(width: 1024, height: 1024)
-        let scale: CGFloat = 0.65
-        let target = NSSize(width: canvasSize.width * scale,
-                            height: canvasSize.height * scale)
-        let aspect = image.size.width / max(image.size.height, 1)
-        var drawSize = target
-        if aspect > 1 {
-            drawSize.height = target.width / aspect
-        } else {
-            drawSize.width = target.height * aspect
-        }
-        let origin = NSPoint(x: (canvasSize.width - drawSize.width) / 2,
-                             y: (canvasSize.height - drawSize.height) / 2)
-        let canvas = NSImage(size: canvasSize)
-        canvas.lockFocus()
-        NSGraphicsContext.current?.imageInterpolation = .none // keep pixel-art crisp
-        image.draw(in: NSRect(origin: origin, size: drawSize),
-                   from: .zero,
-                   operation: .sourceOver,
-                   fraction: 1.0)
-        canvas.unlockFocus()
-        return canvas
-    }
-
-    func noteActivity() {
-        if state != .active { apply(.active) }
-        idleTimer?.invalidate()
-        idleTimer = Timer.scheduledTimer(withTimeInterval: idleAfter, repeats: false) { [weak self] _ in
-            self?.apply(.idle)
-        }
-    }
-
-    private func apply(_ s: State, force: Bool = false) {
-        if !force && state == s { return }
-        state = s
-        if s == .idle {
-            // Setting contentView to nil restores the bundle's AppIcon.
-            NSApp.dockTile.contentView = nil
-            NSApp.dockTile.display()
-            return
-        }
-        guard let img = activeImage else { return }
-        let iv = NSImageView(image: img)
-        iv.imageScaling = .scaleProportionallyUpOrDown
-        NSApp.dockTile.contentView = iv
-        NSApp.dockTile.display()
-    }
-}
-
 class AppDelegate: NSObject, NSApplicationDelegate {
     var windows: [(window: NSWindow, split: SplitContainer)] = []
-    let dockAnimator = DockAnimator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
