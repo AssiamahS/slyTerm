@@ -55,14 +55,10 @@ if [ -f "/Applications/slyTerm.app/Contents/Resources/AppIcon.icns" ]; then
   cp "/Applications/slyTerm.app/Contents/Resources/AppIcon.icns" "$RES_DIR/AppIcon.icns"
 fi
 
-# Dock tile animation frames (idle = >_<, active = dj headphones)
-for f in claude_eyes.png claude_dj.png; do
-  if [ -f "$SRC_DIR/$f" ]; then
-    cp "$SRC_DIR/$f" "$RES_DIR/$f"
-  elif [ -f "$HOME/Downloads/$f" ]; then
-    cp "$HOME/Downloads/$f" "$RES_DIR/$f"
-  fi
-done
+# DockAnimator active-frame: pixelated DJ creature shown while typing
+if [ -f "$SRC_DIR/claude_dj.png" ]; then
+  cp "$SRC_DIR/claude_dj.png" "$RES_DIR/claude_dj.png"
+fi
 
 # Ad-hoc sign so Gatekeeper lets it run
 codesign --force --sign - "$APP"

@@ -253,9 +253,12 @@ func installClickMonitor() {
 }
 
 // Intercept Cmd shortcuts before WebView can swallow them
-// But let Cmd+C/V/X/A pass through to WebView for terminal copy/paste
+// But let Cmd+C/V/X/A pass through to WebView for terminal copy/paste.
+// Also pings the DockAnimator on every keystroke so the dock icon flips
+// to the "active" frame while you're typing.
 func installKeyMonitor() {
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        (NSApp.delegate as? AppDelegate)?.dockAnimator.noteActivity()
         if event.modifierFlags.contains(.command) {
             let chars = event.charactersIgnoringModifiers ?? ""
             // Let copy/paste/cut/selectAll go to WebView (xterm.js handles them)
@@ -270,8 +273,88 @@ func installKeyMonitor() {
     }
 }
 
+// MARK: - DockAnimator
+//
+// Two-state dock tile: idle = the original AppIcon (>_<), active = pixelated
+// DJ-headphones creature loaded from Resources/claude_dj.png. Flips to active
+// on any keystroke, reverts after `idleAfter` seconds of no input. Renders the
+// active frame into a padded canvas so it matches the original icon's
+// proportions instead of filling the whole dock cell.
+
+final class DockAnimator {
+    enum State { case idle, active }
+
+    private let activeImage: NSImage?
+    private(set) var state: State = .idle
+    private var idleTimer: Timer?
+    let idleAfter: TimeInterval = 10
+
+    init() {
+        if let url = Bundle.main.url(forResource: "claude_dj", withExtension: "png"),
+           let raw = NSImage(contentsOf: url) {
+            activeImage = DockAnimator.padToIconCanvas(raw)
+        } else {
+            activeImage = nil
+        }
+        apply(.idle, force: true)
+    }
+
+    /// Render `image` centered on a 1024×1024 transparent canvas at 65% scale.
+    /// This gives the dock tile padding similar to a real app icon, instead
+    /// of having the creature fill the entire cell.
+    static func padToIconCanvas(_ image: NSImage) -> NSImage {
+        let canvasSize = NSSize(width: 1024, height: 1024)
+        let scale: CGFloat = 0.65
+        let target = NSSize(width: canvasSize.width * scale,
+                            height: canvasSize.height * scale)
+        let aspect = image.size.width / max(image.size.height, 1)
+        var drawSize = target
+        if aspect > 1 {
+            drawSize.height = target.width / aspect
+        } else {
+            drawSize.width = target.height * aspect
+        }
+        let origin = NSPoint(x: (canvasSize.width - drawSize.width) / 2,
+                             y: (canvasSize.height - drawSize.height) / 2)
+        let canvas = NSImage(size: canvasSize)
+        canvas.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .none // keep pixel-art crisp
+        image.draw(in: NSRect(origin: origin, size: drawSize),
+                   from: .zero,
+                   operation: .sourceOver,
+                   fraction: 1.0)
+        canvas.unlockFocus()
+        return canvas
+    }
+
+    func noteActivity() {
+        if state != .active { apply(.active) }
+        idleTimer?.invalidate()
+        idleTimer = Timer.scheduledTimer(withTimeInterval: idleAfter, repeats: false) { [weak self] _ in
+            self?.apply(.idle)
+        }
+    }
+
+    private func apply(_ s: State, force: Bool = false) {
+        if !force && state == s { return }
+        state = s
+        if s == .idle {
+            // Setting contentView to nil restores the bundle's AppIcon.
+            NSApp.dockTile.contentView = nil
+            NSApp.dockTile.display()
+            return
+        }
+        guard let img = activeImage else { return }
+        let iv = NSImageView(image: img)
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        NSApp.dockTile.contentView = iv
+        NSApp.dockTile.display()
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var windows: [(window: NSWindow, split: SplitContainer)] = []
+    let dockAnimator = DockAnimator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
