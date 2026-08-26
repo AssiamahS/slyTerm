@@ -55,11 +55,96 @@ final class DropOverlayView: NSView {
     override func wantsPeriodicDraggingUpdates() -> Bool { false }
 }
 
-class TermPane: NSView {
+func slyLog(_ msg: String) {
+    let line = "[\(Date())] \(msg)\n"
+    let path = ("~/Library/Logs/slyterm.log" as NSString).expandingTildeInPath
+    if let data = line.data(using: .utf8) {
+        if let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+            h.seekToEndOfFile(); h.write(data); try? h.close()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+}
+
+/// tmux is the source of truth for which chats exist: one window in the
+/// "slywatch" group per chat, one TermPane per window. Everything here runs
+/// /opt/homebrew/bin/tmux synchronously and is called off the main thread.
+enum Tmux {
+    static let group = "slywatch"
+    static let homeWindow = "home"
+    static var path: String? {
+        for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"] where FileManager.default.isExecutableFile(atPath: p) { return p }
+        return nil
+    }
+
+    @discardableResult
+    static func run(_ args: [String]) -> (status: Int32, out: String) {
+        guard let path else { return (127, "") }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = Pipe()
+        do { try p.run() } catch { return (126, "") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    /// Chat windows in the group (the sleeper "home" window excluded).
+    static func windows() -> [String]? {
+        let r = run(["list-windows", "-t", "=" + group, "-F", "#{window_name}"])
+        guard r.status == 0 else { return nil }
+        return r.out.split(separator: "\n").map(String.init).filter { !$0.isEmpty && $0 != homeWindow }
+    }
+
+    /// Window names that currently have a live client (= a tab whose
+    /// websocket is still connected). A pane whose window is missing from
+    /// this set is showing a dead connection.
+    static func attachedWindows() -> Set<String> {
+        let r = run(["list-clients", "-F", "#{session_group} #{window_name}"])
+        guard r.status == 0 else { return [] }
+        var out = Set<String>()
+        for line in r.out.split(separator: "\n") {
+            let f = line.split(separator: " ", maxSplits: 1)
+            if f.count == 2, f[0] == group { out.insert(String(f[1])) }
+        }
+        return out
+    }
+
+    static func killWindow(_ name: String) {
+        let r = run(["kill-window", "-t", "=\(group):=\(name)"])
+        slyLog("tmux kill-window \(name) status=\(r.status)")
+    }
+}
+
+class TermPane: NSView, WKNavigationDelegate {
+    static let backend = "http://127.0.0.1:7681/"
     let webView: WKWebView
     let dropOverlay = DropOverlayView(frame: .zero)
+    /// tmux window name this tab is bound to (passed to ttyd as ?arg=).
+    let name: String
+    /// Set once the supervisor has seen our window exist; a later absence
+    /// then means the chat ended (as opposed to "not created yet").
+    var sawWindow = false
+    private(set) var loaded = false
+    private var loadStartedAt = Date()
+    private var retryDelay: TimeInterval = 0.5
+    private var retryTimer: Timer?
+    private let status = NSTextField(labelWithString: "")
 
-    init() {
+    var secondsSinceLoad: TimeInterval { Date().timeIntervalSince(loadStartedAt) }
+
+    static func makeName() -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "HHmmss"
+        return "sly-\(fmt.string(from: Date()))-\(String(format: "%02x", Int.random(in: 0..<256)))"
+    }
+
+    init(name: String? = nil) {
+        self.name = name ?? Self.makeName()
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
 
@@ -67,8 +152,14 @@ class TermPane: NSView {
         webView.customUserAgent = "Mozilla/5.0 (Macintosh) AppleWebKit/605.1.15 (KHTML, like Gecko) slyTerm/1.0"
         super.init(frame: .zero)
         wantsLayer = true
+        layer?.backgroundColor = NSColor.black.cgColor
         layer?.borderColor = NSColor.clear.cgColor
         layer?.borderWidth = 1
+        // No white flash / white void: the page background is ours until
+        // xterm paints.
+        webView.setValue(false, forKey: "drawsBackground")
+        if #available(macOS 12.0, *) { webView.underPageBackgroundColor = .black }
+        webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(webView)
         NSLayoutConstraint.activate([
@@ -76,6 +167,17 @@ class TermPane: NSView {
             webView.bottomAnchor.constraint(equalTo: bottomAnchor),
             webView.leadingAnchor.constraint(equalTo: leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+        status.translatesAutoresizingMaskIntoConstraints = false
+        status.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        status.textColor = NSColor.white.withAlphaComponent(0.6)
+        status.alignment = .center
+        status.isHidden = true
+        addSubview(status)
+        NSLayoutConstraint.activate([
+            status.centerXAnchor.constraint(equalTo: centerXAnchor),
+            status.centerYAnchor.constraint(equalTo: centerYAnchor),
+            status.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -40),
         ])
         // Drop overlay on top of webView (added last = topmost)
         dropOverlay.translatesAutoresizingMaskIntoConstraints = false
@@ -89,9 +191,61 @@ class TermPane: NSView {
         dropOverlay.onDrop = { [weak self] info in
             return self?.handleDrop(info) ?? false
         }
-        if let url = URL(string: "http://localhost:7681") {
-            webView.load(URLRequest(url: url))
+        load(reason: "open")
+    }
+
+    deinit { retryTimer?.invalidate() }
+
+    // MARK: - Loading with retry (ttyd may not be up yet at login)
+
+    func load(reason: String) {
+        retryTimer?.invalidate(); retryTimer = nil
+        loaded = false
+        loadStartedAt = Date()
+        var comps = URLComponents(string: Self.backend)!
+        comps.queryItems = [URLQueryItem(name: "arg", value: name)]
+        guard let url = comps.url else { return }
+        slyLog("pane \(name): load (\(reason))")
+        webView.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10))
+    }
+
+    private func showStatus(_ text: String) {
+        status.stringValue = text
+        status.isHidden = false
+    }
+
+    private func scheduleRetry(_ error: Error) {
+        let ns = error as NSError
+        if ns.code == NSURLErrorCancelled { return }   // superseded by a newer load
+        loaded = false
+        showStatus("waiting for terminal backend 127.0.0.1:7681 … (\(ns.code)) retrying")
+        slyLog("pane \(name): load failed \(ns.domain)/\(ns.code) — retry in \(retryDelay)s")
+        retryTimer?.invalidate()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: retryDelay, repeats: false) { [weak self] _ in
+            self?.load(reason: "retry")
         }
+        retryDelay = min(retryDelay * 2, 5)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        loaded = true
+        retryDelay = 0.5
+        status.isHidden = true
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        scheduleRetry(error)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        scheduleRetry(error)
+    }
+
+    /// WebKit killed the content process (memory pressure during sleep is
+    /// the usual cause) — that is the classic silent white screen.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        slyLog("pane \(name): web content process terminated")
+        load(reason: "content-process-died")
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -245,16 +399,17 @@ class SplitContainer: NSView {
     var activeIndex: Int = 0
     private var gridConstraints: [NSLayoutConstraint] = []
 
-    override init(frame: NSRect) {
+    init(frame: NSRect, initialPane: String?) {
         super.init(frame: frame)
-        addPane()
+        addPane(name: initialPane)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func addPane() {
-        guard panes.count < 4 else { return }
-        let pane = TermPane()
+    @discardableResult
+    func addPane(name: String? = nil) -> TermPane? {
+        guard panes.count < 4 else { return nil }
+        let pane = TermPane(name: name)
         pane.translatesAutoresizingMaskIntoConstraints = false
         let click = NSClickGestureRecognizer(target: self, action: #selector(paneClicked(_:)))
         pane.addGestureRecognizer(click)
@@ -262,6 +417,7 @@ class SplitContainer: NSView {
         addSubview(pane)
         activeIndex = panes.count - 1
         relayout()
+        return pane
     }
 
     @objc func paneClicked(_ sender: NSClickGestureRecognizer) {
@@ -272,11 +428,21 @@ class SplitContainer: NSView {
     }
 
     func removeActivePane() {
-        guard panes.count > 1 else { return }
-        let pane = panes[activeIndex]
+        guard panes.indices.contains(activeIndex) else { return }
+        removePane(panes[activeIndex], killChat: true)
+    }
+
+    /// killChat: closing a tab ends its chat (1:1 with tmux and the watch);
+    /// false when the chat already ended and the tab is just following it.
+    func removePane(_ pane: TermPane, killChat: Bool) {
+        guard panes.count > 1, let idx = panes.firstIndex(where: { $0 === pane }) else { return }
         pane.removeFromSuperview()
-        panes.remove(at: activeIndex)
-        activeIndex = max(0, activeIndex - 1)
+        panes.remove(at: idx)
+        activeIndex = min(max(0, activeIndex >= idx ? activeIndex - 1 : activeIndex), panes.count - 1)
+        if killChat {
+            let name = pane.name
+            DispatchQueue.global().async { Tmux.killWindow(name) }
+        }
         relayout()
     }
 
@@ -431,15 +597,115 @@ func installKeyMonitor() {
 class AppDelegate: NSObject, NSApplicationDelegate {
     var windows: [(window: NSWindow, split: SplitContainer)] = []
 
+    private var terminating = false
+    private var supervisor: Timer?
+    private let tmuxQueue = DispatchQueue(label: "slyterm.tmux")
+    /// Orphan windows must be seen on two consecutive polls before a tab is
+    /// opened for them, so a window mid-creation is never double-adopted.
+    private var orphanSeen: Set<String> = []
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         installKeyMonitor()
         installClickMonitor()
-        openNewWindow()
+        slyLog("launch v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "?")")
+        // Chats already alive in tmux (previous run, a crash, the watch)
+        // come back as tabs; only a truly empty tmux gets a fresh chat.
+        tmuxQueue.async { [weak self] in
+            let attached = Tmux.attachedWindows()
+            let existing = (Tmux.windows() ?? []).filter { !attached.contains($0) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if existing.isEmpty {
+                    self.openNewWindow()
+                } else {
+                    slyLog("adopting \(existing.count) live chat(s): \(existing.joined(separator: ", "))")
+                    for name in existing { self.adopt(name) }
+                }
+                self.startSupervisor()
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            slyLog("wake")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.superviseTick() }
+        }
     }
 
-    func openNewWindow() {
-        let split = SplitContainer(frame: .zero)
+    func applicationWillTerminate(_ notification: Notification) {
+        terminating = true
+    }
+
+    // MARK: - tmux supervisor (every 3s): reattach dead tabs, adopt orphans
+
+    private func startSupervisor() {
+        supervisor = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.superviseTick()
+        }
+    }
+
+    private var allPanes: [TermPane] { windows.flatMap { $0.split.panes } }
+
+    private func superviseTick() {
+        guard !terminating else { return }
+        tmuxQueue.async { [weak self] in
+            guard let self else { return }
+            guard let names = Tmux.windows() else { return }   // tmux gone: nothing to do
+            let attached = Tmux.attachedWindows()
+            DispatchQueue.main.async { self.reconcile(windows: Set(names), attached: attached) }
+        }
+    }
+
+    private func reconcile(windows names: Set<String>, attached: Set<String>) {
+        guard !terminating else { return }
+        var owned = Set<String>()
+        for pane in allPanes {
+            owned.insert(pane.name)
+            if names.contains(pane.name) {
+                pane.sawWindow = true
+                // Window alive but no client on it and our page has had time
+                // to connect → the websocket died (sleep, ttyd restart, …).
+                if pane.loaded, pane.secondsSinceLoad > 10, !attached.contains(pane.name) {
+                    slyLog("pane \(pane.name): window alive but detached — reattaching")
+                    pane.load(reason: "detached")
+                }
+            } else if pane.sawWindow, pane.secondsSinceLoad > 10 {
+                // The chat ended (claude exited, or it was closed from the
+                // watch / another terminal): the tab follows it. tmux is the
+                // source of truth, so a tab never outlives its chat.
+                slyLog("pane \(pane.name): window gone — closing tab")
+                closeTab(of: pane)
+            }
+        }
+        // Orphan = a chat window nobody is attached to (started from the
+        // watch, or left behind by a quit/crash). A window some other client
+        // is viewing — Terminal.app via `ccw`, a phone ssh — is theirs.
+        let orphans = names.subtracting(owned).subtracting(attached)
+        for name in orphans where orphanSeen.contains(name) {
+            slyLog("adopting orphan chat \(name)")
+            adopt(name)
+        }
+        orphanSeen = orphans
+    }
+
+    private func closeTab(of pane: TermPane) {
+        guard let entry = windows.first(where: { $0.split.panes.contains { $0 === pane } }) else { return }
+        if entry.split.panes.count > 1 {
+            entry.split.removePane(pane, killChat: false)
+        } else {
+            entry.window.performClose(nil)   // its chat is already gone
+        }
+    }
+
+    /// Give a tmux window a tab: fill the key window's split first (max 4),
+    /// otherwise open a new window for it.
+    private func adopt(_ name: String) {
+        if allPanes.contains(where: { $0.name == name }) { return }
+        if let split = activeSplit, split.panes.count < 4, split.addPane(name: name) != nil { return }
+        openNewWindow(initialPane: name)
+    }
+
+    func openNewWindow(initialPane: String? = nil) {
+        let split = SplitContainer(frame: .zero, initialPane: initialPane)
         split.translatesAutoresizingMaskIntoConstraints = false
 
         let win = AppWindow(
@@ -449,6 +715,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         win.title = "slyTerm"
+        win.backgroundColor = .black
+        // A window created in code defaults to isReleasedWhenClosed = true,
+        // so AppKit released it on close while ARC still owned it through
+        // `windows` — the double release surfaced later as
+        // -[_NSWindowTransformAnimation dealloc] → objc_release SIGSEGV
+        // during the close animation's CA transaction. ARC is the only owner.
+        win.isReleasedWhenClosed = false
         win.contentView?.addSubview(split)
         if let cv = win.contentView {
             NSLayoutConstraint.activate([
@@ -459,12 +732,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ])
         }
 
-        // Offset from existing windows
-        if let last = windows.last?.window {
-            let origin = last.frame.origin
-            win.setFrameOrigin(NSPoint(x: origin.x + 30, y: origin.y - 30))
+        // Offset from existing windows, clamped so the cascade can never
+        // walk a new window off the visible screen.
+        if let last = windows.last(where: { $0.window.isVisible })?.window {
+            var origin = NSPoint(x: last.frame.origin.x + 30, y: last.frame.origin.y - 30)
+            if let vis = (last.screen ?? NSScreen.main)?.visibleFrame {
+                if origin.y < vis.minY || origin.x + win.frame.width > vis.maxX {
+                    origin = NSPoint(x: vis.minX + 40, y: vis.maxY - win.frame.height - 40)
+                }
+            }
+            win.setFrameOrigin(origin)
         } else {
             win.center()
+        }
+
+        // Prune the tracking array when a window closes by ANY path (red
+        // button included). Without this, activeSplit could target a dead
+        // window and Cmd+T would spawn panes — and Claude chats — invisibly.
+        NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: win, queue: .main) { [weak self] note in
+            guard let self, let closed = note.object as? NSWindow else { return }
+            if let entry = self.windows.first(where: { $0.window === closed }), !self.terminating {
+                // Red button / Cmd+W on the last split: end every chat in it.
+                let names = entry.split.panes.map { $0.name }
+                self.tmuxQueue.async { names.forEach(Tmux.killWindow) }
+            }
+            self.windows.removeAll { $0.window === closed }
         }
 
         win.makeKeyAndOrderFront(nil)
@@ -472,10 +764,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     var activeSplit: SplitContainer? {
-        if let keyWindow = NSApp.keyWindow {
-            return windows.first(where: { $0.window === keyWindow })?.split
+        if let keyWindow = NSApp.keyWindow,
+           let entry = windows.first(where: { $0.window === keyWindow }) {
+            return entry.split
         }
-        return windows.last?.split
+        if let mainWindow = NSApp.mainWindow,
+           let entry = windows.first(where: { $0.window === mainWindow }) {
+            return entry.split
+        }
+        return windows.last(where: { $0.window.isVisible })?.split
     }
 
     func setupMenuBar() {
@@ -538,22 +835,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func newSplit() {
-        activeSplit?.addPane()
+        guard let split = activeSplit else {
+            // No visible window to split — give the user a fresh one instead
+            // of silently doing nothing (or worse, feeding a dead window).
+            openNewWindow()
+            return
+        }
+        let before = split.panes.count
+        split.addPane()
+        if split.panes.count == before { NSSound.beep() }  // at the 4-pane cap
     }
 
     @objc func closeSplit() {
         guard let split = activeSplit,
               let entry = windows.first(where: { $0.split === split }) else { return }
         if split.panes.count <= 1 {
-            entry.window.performClose(nil)
-            windows.removeAll { $0.window === entry.window }
+            entry.window.performClose(nil)   // willClose prunes + kills the chat
         } else {
             split.removeActivePane()
         }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return windows.isEmpty
+        // Stay running — dock click reopens a window (see reopen handler).
+        // Now that `windows` is pruned correctly, returning isEmpty here
+        // would quit the app on last close, which the old (buggy) behavior
+        // never did.
+        return false
     }
 
     // Clicking the dock icon when no windows are visible should open one.
