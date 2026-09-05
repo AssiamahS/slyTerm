@@ -20,3 +20,4 @@
 - zsh trap: an unquoted `=slywatch` argument is expanded by zsh to the path of the
   `slywatch` command on PATH. Quote tmux `=name` targets in interactive shells.
 - `launchctl kickstart -k` does NOT re-read an edited plist — bootout + bootstrap.
+- 2026-09-02: RC 'Session creation failed' at login = boot DNS race (claude doesn't retry RC creation); slyterm-shell now waits for api.anthropic.com before exec. tmux 3.5a sanitizes TAB in -F output to '_' — slyterm MCP separators must be printable (SEP='|;|'). Fix a dead tab in place: tmux respawn-window -k -t '=slywatch:N' ~/.local/bin/slyterm-shell
