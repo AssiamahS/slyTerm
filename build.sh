@@ -15,6 +15,7 @@ xcrun swiftc \
   -target arm64-apple-macos14.0 \
   -framework Cocoa \
   -framework WebKit \
+  -import-objc-header "$SRC_DIR/bridge.h" \
   "$SRC_DIR/main.swift" \
   -o "$BIN_DIR/slyTerm"
 
@@ -30,8 +31,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>slyTerm</string>
     <key>CFBundleDisplayName</key><string>slyTerm</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.6.0</string>
-    <key>CFBundleVersion</key><string>10</string>
+    <key>CFBundleShortVersionString</key><string>2.7.0</string>
+    <key>CFBundleVersion</key><string>11</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSAppTransportSecurity</key>

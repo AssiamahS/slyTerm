@@ -608,6 +608,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         installKeyMonitor()
         installClickMonitor()
+        installCommandListener()
         slyLog("launch v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "?")")
         // Chats already alive in tmux (previous run, a crash, the watch)
         // come back as tabs; only a truly empty tmux gets a fresh chat.
@@ -633,6 +634,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         terminating = true
+    }
+
+    // MARK: - command channel (Darwin notify, no Accessibility needed)
+    // `notifyutil -p com.sly.slyterm.newWindow` / `.newSplit` from any shell,
+    // MCP or script opens a window / split instantly — the AppleScript Cmd+T
+    // route hangs for callers without Accessibility (AppleEvent -1712).
+    private var notifyTokens: [Int32] = []
+    private func installCommandListener() {
+        let commands: [(String, () -> Void)] = [
+            ("com.sly.slyterm.newWindow", { [weak self] in self?.openNewWindow() }),
+            ("com.sly.slyterm.newSplit",  { [weak self] in self?.newSplit() }),
+        ]
+        for (name, action) in commands {
+            var token: Int32 = 0
+            let status = notify_register_dispatch(name, &token, DispatchQueue.main) { _ in
+                slyLog("command \(name)")
+                action()
+            }
+            if status == 0 { notifyTokens.append(token) } else { slyLog("notify_register \(name) failed status=\(status)") }
+        }
     }
 
     // MARK: - tmux supervisor (every 3s): reattach dead tabs, adopt orphans
