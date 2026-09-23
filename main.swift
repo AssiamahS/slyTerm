@@ -55,6 +55,11 @@ final class DropOverlayView: NSView {
     override func wantsPeriodicDraggingUpdates() -> Bool { false }
 }
 
+/// Last real click / keypress. A background tab that reloads only takes the
+/// keyboard back off itself when the user has not touched anything since that
+/// load started — otherwise we would fight a deliberate tab switch.
+var lastUserInteraction = Date.distantPast
+
 func slyLog(_ msg: String) {
     let line = "[\(Date())] \(msg)\n"
     let path = ("~/Library/Logs/slyterm.log" as NSString).expandingTildeInPath
@@ -118,6 +123,66 @@ enum Tmux {
         let r = run(["kill-window", "-t", "=\(group):=\(name)"])
         slyLog("tmux kill-window \(name) status=\(r.status)")
     }
+
+    /// slyterm-shell pushes the ?arg= name through [^A-Za-z0-9_-] -> _ because
+    /// tmux parses "a.b" as window.pane: a window called "2.1.276" (Claude
+    /// Code's version, pasted in by automatic-rename) can never be reached with
+    /// -t =NAME. A name that differs from its sanitized form is a chat whose
+    /// tab attaches somewhere else, so the supervisor sees it as permanently
+    /// detached and reloads it forever.
+    static func sanitize(_ name: String) -> String {
+        name.replacingOccurrences(of: "[^A-Za-z0-9_-]", with: "_", options: .regularExpression)
+    }
+
+    /// (index, name) for every window in the group, "home" included.
+    static func windowList() -> [(index: String, name: String)]? {
+        let r = run(["list-windows", "-t", "=" + group, "-F", "#{window_index}\t#{window_name}"])
+        guard r.status == 0 else { return nil }
+        return r.out.split(separator: "\n").compactMap { line in
+            let f = line.split(separator: "\t", maxSplits: 1)
+            guard f.count == 2 else { return nil }
+            return (String(f[0]), String(f[1]))
+        }
+    }
+
+    /// Renamed BY INDEX: the broken name is exactly the one tmux cannot parse
+    /// as a target.
+    @discardableResult
+    static func rename(index: String, to newName: String) -> Bool {
+        let r = run(["rename-window", "-t", "\(group):\(index)", newName])
+        slyLog("tmux rename-window \(index) -> \(newName) status=\(r.status)")
+        return r.status == 0
+    }
+
+    /// Stop tmux from re-renaming a chat window to whatever title claude prints.
+    static func pinName(_ name: String) {
+        run(["set-option", "-w", "-t", "=\(group):=\(name)", "automatic-rename", "off"])
+        run(["set-option", "-w", "-t", "=\(group):=\(name)", "allow-rename", "off"])
+    }
+
+    /// Repair every window tmux can't target, and pin its name so it cannot
+    /// drift again. Returns old -> new so the tab bound to the old name follows
+    /// its chat instead of being orphaned.
+    static func repairNames() -> [String: String] {
+        guard let list = windowList() else { return [:] }
+        var taken = Set(list.map { $0.name })
+        var renamed: [String: String] = [:]
+        for w in list where w.name != homeWindow {
+            let safe = sanitize(w.name)
+            guard safe != w.name else { continue }
+            var candidate = safe
+            var n = 2
+            while taken.contains(candidate) { candidate = "\(safe)-\(n)"; n += 1 }
+            slyLog("window '\(w.name)' is untargetable — renaming to \(candidate)")
+            if rename(index: w.index, to: candidate) {
+                taken.remove(w.name)
+                taken.insert(candidate)
+                renamed[w.name] = candidate
+            }
+        }
+        for name in taken where name != homeWindow { pinName(name) }
+        return renamed
+    }
 }
 
 class TermPane: NSView, WKNavigationDelegate {
@@ -125,12 +190,20 @@ class TermPane: NSView, WKNavigationDelegate {
     let webView: WKWebView
     let dropOverlay = DropOverlayView(frame: .zero)
     /// tmux window name this tab is bound to (passed to ttyd as ?arg=).
-    let name: String
+    /// Mutable because a window repaired by Tmux.repairNames keeps its chat.
+    private(set) var name: String
     /// Set once the supervisor has seen our window exist; a later absence
     /// then means the chat ended (as opposed to "not created yet").
     var sawWindow = false
     private(set) var loaded = false
-    private var loadStartedAt = Date()
+    private(set) var loadStartedAt = Date()
+    /// Consecutive reattaches that never produced a client on our window.
+    /// Capped: a reload storm on a background tab yanks the keyboard — and
+    /// dictation — into that tab every few seconds.
+    var reattachAttempts = 0
+    var reattachGaveUp = false
+    private var wasKeyAtLoad = true
+    private weak var keyWindowAtLoad: NSWindow?
     private var retryDelay: TimeInterval = 0.5
     private var retryTimer: Timer?
     private let status = NSTextField(labelWithString: "")
@@ -144,7 +217,7 @@ class TermPane: NSView, WKNavigationDelegate {
     }
 
     init(name: String? = nil) {
-        self.name = name ?? Self.makeName()
+        self.name = Tmux.sanitize(name ?? Self.makeName())
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
 
@@ -202,6 +275,8 @@ class TermPane: NSView, WKNavigationDelegate {
         retryTimer?.invalidate(); retryTimer = nil
         loaded = false
         loadStartedAt = Date()
+        keyWindowAtLoad = NSApp.keyWindow
+        wasKeyAtLoad = window?.isKeyWindow ?? true
         var comps = URLComponents(string: Self.backend)!
         comps.queryItems = [URLQueryItem(name: "arg", value: name)]
         guard let url = comps.url else { return }
@@ -231,6 +306,38 @@ class TermPane: NSView, WKNavigationDelegate {
         loaded = true
         retryDelay = 0.5
         status.isHidden = true
+        if !wasKeyAtLoad { releaseStolenFocus() }
+    }
+
+    /// ttyd focuses the xterm textarea as soon as the page is up. In a tab
+    /// group that makes this webView first responder and brings its tab
+    /// forward, so a background tab reloading (wake, ttyd restart, a detached
+    /// chat) drags typing and dictation out of the tab the user is in.
+    private func releaseStolenFocus() {
+        let restore = { [weak self] in
+            guard let self else { return }
+            guard lastUserInteraction < self.loadStartedAt else { return }  // user moved on purpose
+            self.webView.evaluateJavaScript(
+                "if(document.activeElement&&document.activeElement.blur)document.activeElement.blur();",
+                completionHandler: nil)
+            if let win = self.window, win.isKeyWindow,
+               let prev = self.keyWindowAtLoad, prev !== win, prev.isVisible {
+                slyLog("pane \(self.name): background reload took focus — handing it back")
+                prev.makeKeyAndOrderFront(nil)
+            }
+        }
+        restore()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: restore)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: restore)
+    }
+
+    /// The chat's tmux window was renamed under us (repairNames) — follow it.
+    func rebind(to newName: String) {
+        slyLog("pane \(name): rebinding to \(newName)")
+        name = newName
+        reattachAttempts = 0
+        reattachGaveUp = false
+        load(reason: "renamed")
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -537,6 +644,7 @@ class AppWindow: NSWindow {
 // which would wipe the selection the user just made.
 func installClickMonitor() {
     NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+        lastUserInteraction = Date()
         if let delegate = NSApp.delegate as? AppDelegate {
             for entry in delegate.windows {
                 for pane in entry.split.panes {
@@ -555,6 +663,7 @@ func installClickMonitor() {
 // But let Cmd+C/V/X/A pass through to WebView for terminal copy/paste.
 func installKeyMonitor() {
     NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        lastUserInteraction = Date()
         if event.modifierFlags.contains(.command) {
             let chars = event.charactersIgnoringModifiers ?? ""
             // Cmd+V: always intercept and inject from NSPasteboard. WKWebView
@@ -628,6 +737,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             slyLog("wake")
+            self?.allPanes.forEach { $0.reattachAttempts = 0; $0.reattachGaveUp = false }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self?.superviseTick() }
         }
     }
@@ -670,9 +780,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard !terminating else { return }
         tmuxQueue.async { [weak self] in
             guard let self else { return }
+            let renamed = Tmux.repairNames()
             guard let names = Tmux.windows() else { return }   // tmux gone: nothing to do
             let attached = Tmux.attachedWindows()
-            DispatchQueue.main.async { self.reconcile(windows: Set(names), attached: attached) }
+            DispatchQueue.main.async {
+                for (old, new) in renamed {
+                    for pane in self.allPanes where pane.name == old { pane.rebind(to: new) }
+                }
+                self.reconcile(windows: Set(names), attached: attached)
+            }
         }
     }
 
@@ -685,9 +801,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 pane.sawWindow = true
                 // Window alive but no client on it and our page has had time
                 // to connect → the websocket died (sleep, ttyd restart, …).
-                if pane.loaded, pane.secondsSinceLoad > 10, !attached.contains(pane.name) {
-                    slyLog("pane \(pane.name): window alive but detached — reattaching")
-                    pane.load(reason: "detached")
+                if attached.contains(pane.name) {
+                    pane.reattachAttempts = 0
+                    pane.reattachGaveUp = false
+                } else if pane.loaded, pane.secondsSinceLoad > 10, !pane.reattachGaveUp {
+                    pane.reattachAttempts += 1
+                    if pane.reattachAttempts > 3 {
+                        // Reloading a tab that never comes back is worse than
+                        // leaving it stale: every reload pulls the keyboard and
+                        // the mic into it. 2026-09-22: a window auto-renamed to
+                        // "2.1.276" reloaded 19k times, ~1 every 12s.
+                        pane.reattachGaveUp = true
+                        slyLog("pane \(pane.name): still detached after 3 reattaches — stopping until wake/repair")
+                    } else {
+                        slyLog("pane \(pane.name): window alive but detached — reattaching (\(pane.reattachAttempts)/3)")
+                        pane.load(reason: "detached")
+                    }
                 }
             } else if pane.sawWindow, pane.secondsSinceLoad > 10 {
                 // The chat ended (claude exited, or it was closed from the
@@ -720,7 +849,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Give a tmux window a tab: fill the key window's split first (max 4),
     /// otherwise open a new window for it.
     private func adopt(_ name: String) {
-        if allPanes.contains(where: { $0.name == name }) { return }
+        if allPanes.contains(where: { $0.name == Tmux.sanitize(name) }) { return }
         if let split = activeSplit, split.panes.count < 4, split.addPane(name: name) != nil { return }
         openNewWindow(initialPane: name)
     }
