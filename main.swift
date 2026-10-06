@@ -83,12 +83,32 @@ enum Tmux {
         return nil
     }
 
+    /// Marker in the server's global environment: the server was forked by a
+    /// process that holds the Microphone grant (this app, or Terminal.app via
+    /// slyterm-restart-server). Pane processes inherit the SERVER's TCC
+    /// identity, so a server created by a launchd agent (the watch bridge,
+    /// ccwatchd, ttyd) gives every chat digital silence — "No audio detected".
+    static let micMarker = "SLYTERM_MIC_OK"
+
+    /// Environment for every tmux call. As a login item the app has no LANG,
+    /// and under the C locale tmux 3.5a prints control characters in -F
+    /// output as "_" — that is how the v2.8.0 name repair silently stopped
+    /// working at boot (its TAB separator never arrived).
+    static func env(_ extra: [String: String] = [:]) -> [String: String] {
+        var e = ProcessInfo.processInfo.environment
+        if e["LANG"] == nil && e["LC_ALL"] == nil { e["LANG"] = "en_US.UTF-8" }
+        e["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + (e["PATH"] ?? "")
+        for (k, v) in extra { e[k] = v }
+        return e
+    }
+
     @discardableResult
-    static func run(_ args: [String]) -> (status: Int32, out: String) {
+    static func run(_ args: [String], env extra: [String: String] = [:]) -> (status: Int32, out: String) {
         guard let path else { return (127, "") }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
+        p.environment = env(extra)
         let pipe = Pipe()
         p.standardOutput = pipe
         p.standardError = Pipe()
@@ -136,14 +156,16 @@ enum Tmux {
 
     /// (index, name) for every window in the group, "home" included.
     static func windowList() -> [(index: String, name: String)]? {
-        let r = run(["list-windows", "-t", "=" + group, "-F", "#{window_index}\t#{window_name}"])
+        // Printable separator on purpose: tmux 3.5a turns a TAB into "_"
+        // when the locale is C (see env()), and a login-item app has no LANG.
+        let r = run(["list-windows", "-t", "=" + group, "-F", "#{window_index}\(sep)#{window_name}"])
         guard r.status == 0 else { return nil }
         return r.out.split(separator: "\n").compactMap { line in
-            let f = line.split(separator: "\t", maxSplits: 1)
-            guard f.count == 2 else { return nil }
-            return (String(f[0]), String(f[1]))
+            guard let range = line.range(of: sep) else { return nil }
+            return (String(line[..<range.lowerBound]), String(line[range.upperBound...]))
         }
     }
+    static let sep = "|;|"
 
     /// Renamed BY INDEX: the broken name is exactly the one tmux cannot parse
     /// as a target.
@@ -182,6 +204,94 @@ enum Tmux {
         }
         for name in taken where name != homeWindow { pinName(name) }
         return renamed
+    }
+
+    // MARK: - server ownership (the mic)
+
+    enum ServerState { case none, micOK, foreign(chats: Int) }
+
+    static func serverState() -> ServerState {
+        guard run(["has-session", "-t", "=" + group]).status == 0 else { return .none }
+        let e = run(["show-environment", "-g", micMarker])
+        if e.status == 0, e.out.hasPrefix(micMarker + "=") { return .micOK }
+        return .foreign(chats: windows()?.count ?? 0)
+    }
+
+    /// Fork the base session from THIS process so every chat inherits the
+    /// app's Microphone grant. The "home" window is a sleeper, never a chat.
+    static func createServer() -> Bool {
+        let r = run(["new-session", "-d", "-s", group, "-n", homeWindow, "-x", "200", "-y", "50",
+                     "exec sleep 2147483647"], env: [micMarker: "1"])
+        guard r.status == 0 else { slyLog("tmux new-session failed status=\(r.status)"); return false }
+        run(["set-environment", "-g", micMarker, "1"])
+        pinName(homeWindow)
+        slyLog("tmux server created by slyTerm (mic-capable)")
+        return true
+    }
+
+    /// Make sure a server exists and, when nobody is chatting on a server a
+    /// launchd agent forked (the watch bridge / ccwatchd win the login race),
+    /// replace it with ours. A foreign server WITH chats is left alone and
+    /// reported, so the user can choose to restart the chats (migrateServer).
+    static func bootstrapServer() -> ServerState {
+        for attempt in 1...5 {
+            let state = serverState()
+            switch state {
+            case .micOK:
+                return state
+            case .none:
+                if createServer() { return .micOK }
+            case .foreign(let chats):
+                guard chats == 0 else { slyLog("tmux server is not mic-capable and has \(chats) chat(s)"); return state }
+                slyLog("taking over an idle server forked elsewhere (attempt \(attempt))")
+                run(["kill-server"])
+                if createServer() { return .micOK }
+            }
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+        return serverState()
+    }
+
+    /// Chat window -> Claude session id, read from ~/.claude/sessions/<pane pid>.json.
+    static func chatSessions() -> [(name: String, sid: String?)] {
+        let r = run(["list-panes", "-s", "-t", "=" + group, "-F", "#{window_name}\(sep)#{pane_pid}"])
+        guard r.status == 0 else { return [] }
+        let dir = ("~/.claude/sessions" as NSString).expandingTildeInPath
+        return r.out.split(separator: "\n").compactMap { line -> (String, String?)? in
+            guard let range = line.range(of: sep) else { return nil }
+            let name = String(line[..<range.lowerBound]), pid = String(line[range.upperBound...])
+            guard name != homeWindow else { return nil }
+            var sid: String?
+            if let data = FileManager.default.contents(atPath: "\(dir)/\(pid).json"),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                sid = obj["sessionId"] as? String
+            }
+            return (name, sid)
+        }
+    }
+
+    /// Restart every chat under a mic-capable server: kill the server and
+    /// recreate each window with SLYTERM_RESUME=<session id> (slyterm-shell
+    /// turns that into `claude --resume`). Returns the window names.
+    static func migrateServer() -> [String] {
+        let chats = chatSessions()
+        slyLog("migrating \(chats.count) chat(s) to a mic-capable server")
+        run(["kill-server"])
+        Thread.sleep(forTimeInterval: 1)
+        // A launchd agent may recreate an idle session in the gap; bootstrap
+        // takes it over. Never bail out here — the chats must come back.
+        if case .none = Tmux.bootstrapServer() { slyLog("migrateServer: could not create a server"); return [] }
+        let shell = ("~/.local/bin/slyterm-shell" as NSString).expandingTildeInPath
+        var names: [String] = []
+        for c in chats {
+            var args = ["new-window", "-d", "-t", "=" + group, "-n", c.name]
+            if let sid = c.sid { args += ["-e", "SLYTERM_RESUME=\(sid)"] }
+            args.append(shell)
+            let r = run(args)
+            slyLog("window '\(c.name)' -> \(c.sid.map { "resume " + $0 } ?? "fresh chat") status=\(r.status)")
+            if r.status == 0 { names.append(c.name); pinName(c.name) }
+        }
+        return names
     }
 }
 
@@ -314,6 +424,10 @@ class TermPane: NSView, WKNavigationDelegate {
     /// forward, so a background tab reloading (wake, ttyd restart, a detached
     /// chat) drags typing and dictation out of the tab the user is in.
     private func releaseStolenFocus() {
+        // Only when ANOTHER window was key: at login the first tab's window is
+        // simply not key yet (the app is still activating), and blurring it
+        // left a terminal that took no clicks or typing (v2.8.0 regression).
+        guard let prev = keyWindowAtLoad, prev !== window else { return }
         let restore = { [weak self] in
             guard let self else { return }
             guard lastUserInteraction < self.loadStartedAt else { return }  // user moved on purpose
@@ -329,6 +443,12 @@ class TermPane: NSView, WKNavigationDelegate {
         restore()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: restore)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: restore)
+    }
+
+    /// Put the keyboard into this pane's xterm (ttyd exposes window.term).
+    func focusTerminal() {
+        window?.makeFirstResponder(webView)
+        webView.evaluateJavaScript("if(window.term&&window.term.focus)window.term.focus();", completionHandler: nil)
     }
 
     /// The chat's tmux window was renamed under us (repairNames) — follow it.
@@ -654,6 +774,14 @@ func installClickMonitor() {
                     )
                 }
             }
+            // A click lands the keyboard in that terminal, whatever the page
+            // thinks its active element is (a blurred xterm ignored clicks).
+            if let win = event.window, let entry = delegate.windows.first(where: { $0.window === win }) {
+                let pt = win.contentView?.convert(event.locationInWindow, from: nil) ?? .zero
+                if let pane = entry.split.panes.first(where: { $0.frame.contains($0.superview?.convert(pt, from: win.contentView) ?? pt) }) {
+                    DispatchQueue.main.async { pane.focusTerminal() }
+                }
+            }
         }
         return event
     }
@@ -722,6 +850,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Chats already alive in tmux (previous run, a crash, the watch)
         // come back as tabs; only a truly empty tmux gets a fresh chat.
         tmuxQueue.async { [weak self] in
+            // The server must be OURS before the first tab's ttyd shell looks
+            // for it: whoever forks it decides whether the mic works.
+            let state = Tmux.bootstrapServer()
             let attached = Tmux.attachedWindows()
             let existing = (Tmux.windows() ?? []).filter { !attached.contains($0) }
             DispatchQueue.main.async {
@@ -733,6 +864,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     for name in existing { self.adopt(name) }
                 }
                 self.startSupervisor()
+                if case .foreign(let chats) = state, chats > 0 { self.offerMicFix(chats: chats) }
             }
         }
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -755,6 +887,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let commands: [(String, () -> Void)] = [
             ("com.sly.slyterm.newWindow", { [weak self] in self?.openNewWindow() }),
             ("com.sly.slyterm.newSplit",  { [weak self] in self?.newSplit() }),
+            // slyterm-shell asks us to fork the server when a tab finds none
+            // (login, or after a kill-server) — never a launchd agent.
+            ("com.sly.slyterm.ensureServer", { [weak self] in self?.tmuxQueue.async { _ = Tmux.bootstrapServer() } }),
+            ("com.sly.slyterm.fixMic", { [weak self] in self?.fixMicrophone() }),
         ]
         for (name, action) in commands {
             var token: Int32 = 0
@@ -776,8 +912,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var allPanes: [TermPane] { windows.flatMap { $0.split.panes } }
 
+    private var migrating = false
+
     private func superviseTick() {
-        guard !terminating else { return }
+        guard !terminating, !migrating else { return }
         tmuxQueue.async { [weak self] in
             guard let self else { return }
             let renamed = Tmux.repairNames()
@@ -835,6 +973,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             adopt(name)
         }
         orphanSeen = orphans
+    }
+
+    /// A launchd agent forked the tmux server before we could, so every chat
+    /// is deaf. Restarting them (claude --resume) under our server fixes it.
+    private func offerMicFix(chats: Int) {
+        let alert = NSAlert()
+        alert.messageText = "Microphone is off for these chats"
+        alert.informativeText = "\(chats) chat(s) started under a tmux server that has no microphone access. Restart them now? Each chat resumes where it was (claude --resume)."
+        alert.addButton(withTitle: "Restart Chats")
+        alert.addButton(withTitle: "Later")
+        guard let win = windows.first?.window else { return }
+        alert.beginSheetModal(for: win) { [weak self] r in if r == .alertFirstButtonReturn { self?.fixMicrophone() } }
+    }
+
+    @objc func fixMicrophone() {
+        guard !migrating else { return }
+        migrating = true
+        slyLog("fixMicrophone: restarting chats under a mic-capable server")
+        tmuxQueue.async { [weak self] in
+            let names = Tmux.migrateServer()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                // Every tab's websocket died with the old server: reload each
+                // by name so it attaches to its recreated window.
+                for pane in self.allPanes {
+                    pane.reattachAttempts = 0; pane.reattachGaveUp = false
+                    pane.load(reason: "migrated")
+                }
+                self.migrating = false
+                slyLog("fixMicrophone: done, \(names.count) window(s) recreated")
+            }
+        }
     }
 
     private func closeTab(of pane: TermPane) {
@@ -948,6 +1118,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         shellMenu.addItem(withTitle: "New Window", action: #selector(newWindow), keyEquivalent: "n")
         shellMenu.addItem(withTitle: "New Split", action: #selector(newSplit), keyEquivalent: "t")
         shellMenu.addItem(withTitle: "Close Split", action: #selector(closeSplit), keyEquivalent: "w")
+        shellMenu.addItem(.separator())
+        shellMenu.addItem(withTitle: "Restart Chats for Microphone", action: #selector(fixMicrophone), keyEquivalent: "")
         shellMenuItem.submenu = shellMenu
         mainMenu.addItem(shellMenuItem)
 
